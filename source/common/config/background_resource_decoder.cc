@@ -1,14 +1,10 @@
 #include "source/common/config/background_resource_decoder.h"
 
-#include <chrono>
-
 #if defined(__linux__)
 #include <sys/prctl.h>
 #elif defined(__APPLE__)
 #include <pthread.h>
 #endif
-
-#include "envoy/common/exception.h"
 
 #include "source/common/common/assert.h"
 

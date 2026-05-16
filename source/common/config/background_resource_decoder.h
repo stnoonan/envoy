@@ -1,16 +1,15 @@
 #pragma once
 
-#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include "envoy/common/pure.h"
 #include "envoy/config/subscription.h"
 #include "envoy/event/dispatcher.h"
 
@@ -19,6 +18,7 @@
 #include "source/common/config/decoded_resource_impl.h"
 #include "source/common/protobuf/protobuf.h"
 
+#include "absl/functional/any_invocable.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 
@@ -132,7 +132,9 @@ private:
     OpaqueResourceDecoderSharedPtr resource_decoder;
     Protobuf::RepeatedPtrField<Protobuf::Any> resources;
     std::string version;
-    Event::Dispatcher* dispatcher;
+    // Default-initialized so that `Batch{};` in workerLoop() is well-defined
+    // before the immediate move-assignment from the queue.
+    Event::Dispatcher* dispatcher{nullptr};
     DecodeBatchCallback on_complete;
   };
 
