@@ -555,11 +555,17 @@ void GrpcMuxImpl::onDiscoveryResponseAsync(
   // this guard, a completion lambda that arrives in the dispatcher queue
   // after the GrpcMuxImpl is gone would fire the ScopedResume's cleanup
   // lambda (which captures `this`) on destruction, causing a use-after-free.
+  // Constructor takes args by value so make_shared can emplace-construct
+  // without needing GuardedResume to be copy- or move-constructible (the
+  // user-defined destructor would otherwise suppress the implicit move
+  // constructor and the embedded unique_ptr would block any implicit copy).
   struct GuardedResume {
     ScopedResume inner;
     std::shared_ptr<std::atomic<bool>> alive_token;
+    GuardedResume(ScopedResume i, std::shared_ptr<std::atomic<bool>> t)
+        : inner(std::move(i)), alive_token(std::move(t)) {}
     ~GuardedResume() {
-      if (inner && !alive_token->load(std::memory_order_acquire)) {
+      if (inner && alive_token && !alive_token->load(std::memory_order_acquire)) {
         inner->cancel();
       }
     }
@@ -571,14 +577,13 @@ void GrpcMuxImpl::onDiscoveryResponseAsync(
   auto message_holder =
       std::make_shared<std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>>(
           std::move(message));
-  auto resume_holder =
-      std::make_shared<GuardedResume>(GuardedResume{std::move(same_type_resume), alive_token});
+  auto resume_holder = std::make_shared<GuardedResume>(std::move(same_type_resume), alive_token);
 
   background_decoder_->submit(
       std::move(resource_decoder), std::move(resources), version_info, dispatcher_,
       [this, alive_token = std::move(alive_token), message_holder = std::move(message_holder),
-       resume_holder = std::move(resume_holder)](
-          std::vector<DecodedResourceOrError> decoded_results) mutable {
+       resume_holder =
+           std::move(resume_holder)](std::vector<DecodedResourceOrError> decoded_results) mutable {
         if (!alive_token->load(std::memory_order_acquire)) {
           // GrpcMuxImpl was destroyed between submit and apply; drop everything
           // on the floor. The xDS stream is being torn down too, so there is

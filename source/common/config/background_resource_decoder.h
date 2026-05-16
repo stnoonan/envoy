@@ -143,9 +143,9 @@ private:
 
   mutable std::mutex mu_;
   std::condition_variable cv_;
-  std::deque<Batch> queue_;            // guarded by mu_
-  bool stopping_{false};               // guarded by mu_
-  bool processing_{false};             // guarded by mu_
+  std::deque<Batch> queue_; // guarded by mu_
+  bool stopping_{false};    // guarded by mu_
+  bool processing_{false};  // guarded by mu_
 
   // worker_ is initialized last so the loop only starts after the rest of the
   // state is constructed.

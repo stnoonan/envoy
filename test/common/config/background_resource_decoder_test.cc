@@ -90,8 +90,7 @@ TEST_F(BackgroundResourceDecoderTest, BasicSubmitAndComplete) {
   std::atomic<std::thread::id> cb_thread_id{};
 
   background_->submit(decoder_, makeAnyList({"type.googleapis.com/a", "type.googleapis.com/b"}),
-                      "v1", *dispatcher_,
-                      [&](std::vector<DecodedResourceOrError> results) {
+                      "v1", *dispatcher_, [&](std::vector<DecodedResourceOrError> results) {
                         cb_thread_id = std::this_thread::get_id();
                         received = std::move(results);
                         done = true;
@@ -115,9 +114,8 @@ TEST_F(BackgroundResourceDecoderTest, FifoOrdering) {
   std::atomic<int> remaining{3};
 
   auto submit_batch = [&](int idx) {
-    background_->submit(decoder_,
-                        makeAnyList({"type.googleapis.com/b" + std::to_string(idx)}), "v1",
-                        *dispatcher_, [&, idx](std::vector<DecodedResourceOrError>) {
+    background_->submit(decoder_, makeAnyList({"type.googleapis.com/b" + std::to_string(idx)}),
+                        "v1", *dispatcher_, [&, idx](std::vector<DecodedResourceOrError>) {
                           completion_order.push_back(idx);
                           --remaining;
                         });
@@ -142,11 +140,9 @@ TEST_F(BackgroundResourceDecoderTest, ShutdownDropsPendingBatches) {
   // Pile up a number of batches; we expect at most a few to drain before
   // shutdown.
   for (int i = 0; i < 64; ++i) {
-    background_->submit(decoder_,
-                        makeAnyList({"type.googleapis.com/x" + std::to_string(i)}), "v1",
-                        *dispatcher_, [&](std::vector<DecodedResourceOrError>) {
-                          ++callbacks_invoked;
-                        });
+    background_->submit(decoder_, makeAnyList({"type.googleapis.com/x" + std::to_string(i)}), "v1",
+                        *dispatcher_,
+                        [&](std::vector<DecodedResourceOrError>) { ++callbacks_invoked; });
   }
 
   // Tear down immediately. The worker joins; any batches it did not get to are

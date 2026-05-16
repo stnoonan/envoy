@@ -300,9 +300,10 @@ private:
 
   // Continuation of the async path; runs on the dispatcher thread once
   // background decoding has completed.
-  void applyDecodedResources(
-      std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse> message,
-      std::vector<DecodedResourceOrError> decoded_results, ScopedResume same_type_resume);
+  void
+  applyDecodedResources(std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse> message,
+                        std::vector<DecodedResourceOrError> decoded_results,
+                        ScopedResume same_type_resume);
 
   Event::Dispatcher& dispatcher_;
   // Multiplexes the stream to the primary and failover sources.
@@ -357,8 +358,7 @@ private:
   // torn down and bail out safely. Wrapped in a shared_ptr so the atomic
   // outlives the GrpcMuxImpl itself; this is the standard "weak self"
   // workaround when the object is not held by a shared_ptr.
-  const std::shared_ptr<std::atomic<bool>> alive_token_{
-      std::make_shared<std::atomic<bool>>(true)};
+  const std::shared_ptr<std::atomic<bool>> alive_token_{std::make_shared<std::atomic<bool>>(true)};
 };
 
 using GrpcMuxImplPtr = std::unique_ptr<GrpcMuxImpl>;
