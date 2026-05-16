@@ -549,12 +549,30 @@ void GrpcMuxImpl::onDiscoveryResponseAsync(
   // Capture a copy of the alive token; the lambda will check this before
   // touching any GrpcMuxImpl state.
   std::shared_ptr<std::atomic<bool>> alive_token = alive_token_;
-  // Move-capture the message into a shared_ptr because absl::AnyInvocable
-  // lambdas requires copyable captures across some toolchains.
+
+  // Hold the ScopedResume in a small RAII wrapper whose destructor cancels
+  // the underlying Cleanup if this GrpcMuxImpl has been destroyed. Without
+  // this guard, a completion lambda that arrives in the dispatcher queue
+  // after the GrpcMuxImpl is gone would fire the ScopedResume's cleanup
+  // lambda (which captures `this`) on destruction, causing a use-after-free.
+  struct GuardedResume {
+    ScopedResume inner;
+    std::shared_ptr<std::atomic<bool>> alive_token;
+    ~GuardedResume() {
+      if (inner && !alive_token->load(std::memory_order_acquire)) {
+        inner->cancel();
+      }
+    }
+  };
+
+  // Wrap move-only objects in shared_ptr so the lambda capture is
+  // copy-constructible (some dispatcher post fallbacks type-erase through
+  // std::function).
   auto message_holder =
       std::make_shared<std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>>(
           std::move(message));
-  auto resume_holder = std::make_shared<ScopedResume>(std::move(same_type_resume));
+  auto resume_holder =
+      std::make_shared<GuardedResume>(GuardedResume{std::move(same_type_resume), alive_token});
 
   background_decoder_->submit(
       std::move(resource_decoder), std::move(resources), version_info, dispatcher_,
@@ -564,11 +582,13 @@ void GrpcMuxImpl::onDiscoveryResponseAsync(
         if (!alive_token->load(std::memory_order_acquire)) {
           // GrpcMuxImpl was destroyed between submit and apply; drop everything
           // on the floor. The xDS stream is being torn down too, so there is
-          // nothing meaningful to apply or ACK.
+          // nothing meaningful to apply or ACK. resume_holder's destructor
+          // will cancel the inner ScopedResume so the pause-cleanup lambda
+          // does not dereference our dead `this`.
           return;
         }
         applyDecodedResources(std::move(*message_holder), std::move(decoded_results),
-                              std::move(*resume_holder));
+                              std::move(resume_holder->inner));
       });
 }
 
