@@ -22,6 +22,23 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "background_resource_decoder_test",
+    srcs = ["background_resource_decoder_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        "//envoy/api:api_interface",
+        "//source/common/config:background_resource_decoder_lib",
+        "//source/common/config:decoded_resource_lib",
+        "//source/common/config:opaque_resource_decoder_lib",
+        "//source/common/protobuf",
+        "//test/mocks/config:config_mocks",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:utility_lib",
+        "@envoy_api//envoy/service/discovery/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_test(
     name = "ttl_test",
     srcs = ["ttl_test.cc"],
     rbe_pool = "6gig",

@@ -134,6 +134,16 @@ FALSE_RUNTIME_GUARD(
     envoy_reloadable_features_enable_formatter_for_ratelimit_action_descriptor_value);
 // TODO(adisuissa) reset to true to enable unified mux by default
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_unified_mux);
+// When enabled, GrpcMuxImpl will hand off Protobuf::Any -> typed-message
+// decoding for SotW DiscoveryResponses to a dedicated background worker thread
+// (Envoy::Config::BackgroundResourceDecoder). Decoding results are posted back
+// to the main dispatcher, which then runs the apply step under the existing
+// main-thread invariants. This trades a small amount of latency for not
+// blocking the main thread on large config payloads (e.g. EDS pushes with
+// thousands of endpoints). Off by default while the feature stabilizes.
+// TODO(stnoonan): flip to RUNTIME_GUARD once we have soak data and extend
+// coverage to NewGrpcMuxImpl / xDS mux delta paths.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_xds_decode_off_main_thread);
 // Used to track if runtime is initialized.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_runtime_initialized);
 // TODO(alyssawilk, renjietang) figure out what to do with this for optimal defaults

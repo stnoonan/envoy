@@ -30,6 +30,7 @@ absl::Status onDeprecatedFieldCommon(absl::string_view description, bool soft_de
 } // namespace
 
 void WipCounterBase::setWipCounter(Stats::Counter& wip_counter) {
+  absl::MutexLock lock(&mutex_);
   ASSERT(wip_counter_ == nullptr);
   wip_counter_ = &wip_counter;
   wip_counter.add(prestats_wip_count_);
@@ -37,6 +38,7 @@ void WipCounterBase::setWipCounter(Stats::Counter& wip_counter) {
 
 void WipCounterBase::onWorkInProgressCommon(absl::string_view description) {
   ENVOY_LOG_MISC(warn, "{}", description);
+  absl::MutexLock lock(&mutex_);
   if (wip_counter_ != nullptr) {
     wip_counter_->inc();
   } else {
@@ -47,6 +49,7 @@ void WipCounterBase::onWorkInProgressCommon(absl::string_view description) {
 void WarningValidationVisitorImpl::setCounters(Stats::Counter& unknown_counter,
                                                Stats::Counter& wip_counter) {
   setWipCounter(wip_counter);
+  absl::MutexLock lock(&mutex_);
   ASSERT(unknown_counter_ == nullptr);
   unknown_counter_ = &unknown_counter;
   unknown_counter.add(prestats_unknown_count_);
@@ -54,18 +57,29 @@ void WarningValidationVisitorImpl::setCounters(Stats::Counter& unknown_counter,
 
 absl::Status WarningValidationVisitorImpl::onUnknownField(absl::string_view description) {
   const uint64_t hash = HashUtil::xxHash64(description);
-  auto it = descriptions_.insert(hash);
-  // If we've seen this before, skip.
-  if (!it.second) {
-    return absl::OkStatus();
+  bool newly_seen;
+  Stats::Counter* counter_to_bump = nullptr;
+  {
+    absl::MutexLock lock(&mutex_);
+    newly_seen = descriptions_.insert(hash).second;
+    if (!newly_seen) {
+      return absl::OkStatus();
+    }
+    if (unknown_counter_ == nullptr) {
+      ++prestats_unknown_count_;
+    } else {
+      counter_to_bump = unknown_counter_;
+    }
   }
 
-  // It's a new field, log and bump stat.
+  // Logging and counter increment are intentionally done outside the mutex to
+  // keep the critical section short and to avoid lock-order inversions with
+  // logging sinks. counter_to_bump, if non-null, remains valid for the
+  // process lifetime once installed (counters are owned by the root stats
+  // store).
   ENVOY_LOG(warn, "Unknown field: {}", description);
-  if (unknown_counter_ == nullptr) {
-    ++prestats_unknown_count_;
-  } else {
-    unknown_counter_->inc();
+  if (counter_to_bump != nullptr) {
+    counter_to_bump->inc();
   }
   return absl::OkStatus();
 }

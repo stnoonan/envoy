@@ -147,7 +147,17 @@ GrpcMuxImpl::createGrpcStreamObject(Grpc::RawAsyncClientSharedPtr&& async_client
           envoy::service::discovery::v3::DiscoveryResponse>::ConnectedStateValue::FirstEntry);
 }
 
-GrpcMuxImpl::~GrpcMuxImpl() { AllMuxes::get().erase(this); }
+GrpcMuxImpl::~GrpcMuxImpl() {
+  // Order matters: we must flip the liveness token *before* destroying the
+  // background decoder. The decoder destructor joins its worker thread, which
+  // guarantees no NEW posts to dispatcher_ will be enqueued after the join
+  // returns. Posts that were already enqueued before the join may still fire,
+  // but they capture alive_token_ by shared_ptr and will see it == false and
+  // bail out without touching `this`.
+  alive_token_->store(false, std::memory_order_release);
+  background_decoder_.reset();
+  AllMuxes::get().erase(this);
+}
 
 void GrpcMuxImpl::shutdownAll() { AllMuxes::get().shutdownAll(); }
 
@@ -359,6 +369,7 @@ ScopedResume GrpcMuxImpl::pause(const std::vector<std::string> type_urls) {
 void GrpcMuxImpl::onDiscoveryResponse(
     std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>&& message,
     ControlPlaneStats& control_plane_stats) {
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
   const std::string type_url = message->type_url();
   ENVOY_LOG(debug, "Received gRPC message for {} at version {}", type_url, message->version_info());
 
@@ -400,12 +411,26 @@ void GrpcMuxImpl::onDiscoveryResponse(
     }
     return;
   }
-  ScopedResume same_type_resume;
-  // We pause updates of the same type. This is necessary for SotW and GrpcMuxImpl, since unlike
-  // delta and NewGRpcMuxImpl, independent watch additions/removals trigger updates regardless of
-  // the delta state. The proper fix for this is to converge these implementations,
-  // see https://github.com/envoyproxy/envoy/issues/11477.
-  same_type_resume = pause(type_url);
+
+  // We pause updates of the same type until the apply step completes. This is necessary for SotW
+  // and GrpcMuxImpl, since unlike delta and NewGRpcMuxImpl, independent watch additions/removals
+  // trigger updates regardless of the delta state. The proper fix for this is to converge these
+  // implementations, see https://github.com/envoyproxy/envoy/issues/11477. The ScopedResume is
+  // either held until the end of the synchronous path, or moved into the async continuation.
+  ScopedResume same_type_resume = pause(type_url);
+
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.xds_decode_off_main_thread")) {
+    onDiscoveryResponseAsync(std::move(message), api_state, std::move(same_type_resume));
+  } else {
+    onDiscoveryResponseSync(std::move(message), api_state, std::move(same_type_resume));
+  }
+}
+
+void GrpcMuxImpl::onDiscoveryResponseSync(
+    std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>&& message,
+    ApiState& api_state, ScopedResume same_type_resume) {
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
+  const std::string type_url = message->type_url();
   TRY_ASSERT_MAIN_THREAD {
     std::vector<DecodedResourcePtr> resources;
     OpaqueResourceDecoder& resource_decoder = *api_state.watches_.front()->resource_decoder_;
@@ -455,6 +480,162 @@ void GrpcMuxImpl::onDiscoveryResponse(
   api_state.request_.set_response_nonce(message->nonce());
   ASSERT(api_state.paused());
   queueDiscoveryRequest(type_url);
+  // same_type_resume drops here, resuming the type.
+  (void)same_type_resume;
+}
+
+void GrpcMuxImpl::onDiscoveryResponseAsync(
+    std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>&& message,
+    ApiState& api_state, ScopedResume same_type_resume) {
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
+  const std::string type_url = message->type_url();
+
+  // Lazily construct the background decoder on first async use. One per
+  // GrpcMuxImpl is sufficient: per-type-URL ordering is preserved by the FIFO
+  // queue (each batch's completion is posted back before the next batch is
+  // dequeued).
+  if (background_decoder_ == nullptr) {
+    background_decoder_ = std::make_unique<BackgroundResourceDecoder>("envoy.xds.decode");
+  }
+
+  // Cheap, main-thread-only validation before we hand off: every resource's
+  // type_url must match the message-wide type_url (modulo the Resource wrapper).
+  // Doing this synchronously means we NACK invalid pushes without ever paying
+  // the background hop, and it matches the legacy error semantics. We still
+  // throw inside TRY_ASSERT_MAIN_THREAD so the NACK path uses the same code as
+  // the sync version.
+  TRY_ASSERT_MAIN_THREAD {
+    for (const auto& resource : message->resources()) {
+      if (!resource.Is<envoy::service::discovery::v3::Resource>() &&
+          type_url != resource.type_url()) {
+        throwEnvoyExceptionOrPanic(
+            fmt::format("{} does not match the message-wide type URL {} in DiscoveryResponse {}",
+                        resource.type_url(), type_url, message->DebugString()));
+      }
+    }
+  }
+  END_TRY
+  CATCH(const EnvoyException& e, {
+    for (auto watch : api_state.watches_) {
+      watch->callbacks_.onConfigUpdateFailed(
+          Envoy::Config::ConfigUpdateFailureReason::UpdateRejected, &e);
+    }
+    ::google::rpc::Status* error_detail = api_state.request_.mutable_error_detail();
+    error_detail->set_code(Grpc::Status::WellKnownGrpcStatus::Internal);
+    error_detail->set_message(Config::Utility::truncateGrpcStatusMessage(e.what()));
+    if (xds_config_tracker_.has_value()) {
+      xds_config_tracker_->onConfigRejected(*message, error_detail->message());
+    }
+    api_state.previously_fetched_data_ = true;
+    api_state.request_.set_response_nonce(message->nonce());
+    ASSERT(api_state.paused());
+    queueDiscoveryRequest(type_url);
+    return;
+  });
+
+  // Snapshot the decoder pointer up-front. If watches change between submit
+  // and apply, the apply step re-fetches whatever decoder is current; this
+  // snapshot is just what we use to actually parse the bytes. The shared_ptr
+  // keeps the decoder object alive even if its owning watch is dropped.
+  OpaqueResourceDecoderSharedPtr resource_decoder = api_state.watches_.front()->resource_decoder_;
+
+  // Move the resources out of the message so the background thread owns them.
+  // We keep `message` alive for nonce/version metadata; the resources field
+  // is left empty after the move.
+  Protobuf::RepeatedPtrField<Protobuf::Any> resources;
+  message->mutable_resources()->Swap(&resources);
+  const std::string version_info = message->version_info();
+
+  // Capture a copy of the alive token; the lambda will check this before
+  // touching any GrpcMuxImpl state.
+  std::shared_ptr<std::atomic<bool>> alive_token = alive_token_;
+  // Move-capture the message into a shared_ptr because absl::AnyInvocable
+  // lambdas requires copyable captures across some toolchains.
+  auto message_holder =
+      std::make_shared<std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>>(
+          std::move(message));
+  auto resume_holder = std::make_shared<ScopedResume>(std::move(same_type_resume));
+
+  background_decoder_->submit(
+      std::move(resource_decoder), std::move(resources), version_info, dispatcher_,
+      [this, alive_token = std::move(alive_token), message_holder = std::move(message_holder),
+       resume_holder = std::move(resume_holder)](
+          std::vector<DecodedResourceOrError> decoded_results) mutable {
+        if (!alive_token->load(std::memory_order_acquire)) {
+          // GrpcMuxImpl was destroyed between submit and apply; drop everything
+          // on the floor. The xDS stream is being torn down too, so there is
+          // nothing meaningful to apply or ACK.
+          return;
+        }
+        applyDecodedResources(std::move(*message_holder), std::move(decoded_results),
+                              std::move(*resume_holder));
+      });
+}
+
+void GrpcMuxImpl::applyDecodedResources(
+    std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse> message,
+    std::vector<DecodedResourceOrError> decoded_results, ScopedResume same_type_resume) {
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
+  const std::string type_url = message->type_url();
+
+  // The subscription set may have changed while we were decoding. If the
+  // ApiState is gone, or its watches list is now empty, treat this as a
+  // late-arriving response and discard it gracefully.
+  auto api_state_iter = api_state_.find(type_url);
+  if (api_state_iter == api_state_.end() || api_state_iter->second->watches_.empty()) {
+    ENVOY_LOG(debug,
+              "Dropping background-decoded DiscoveryResponse for {} because its watches were "
+              "removed mid-flight",
+              type_url);
+    return;
+  }
+  ApiState& api_state = *api_state_iter->second;
+
+  TRY_ASSERT_MAIN_THREAD {
+    // Surface the first per-resource decode error as a single NACK, matching
+    // the sync path which throws on the first failure.
+    for (auto& result : decoded_results) {
+      if (!result.ok()) {
+        throwEnvoyExceptionOrPanic(std::string(result.status().message()));
+      }
+    }
+
+    std::vector<DecodedResourcePtr> resources;
+    resources.reserve(decoded_results.size());
+    for (auto& result : decoded_results) {
+      DecodedResourceImplPtr decoded = std::move(result.value());
+      if (!isHeartbeatResource(type_url, *decoded)) {
+        resources.emplace_back(std::move(decoded));
+      }
+    }
+
+    processDiscoveryResources(resources, api_state, type_url, message->version_info(),
+                              /*call_delegate=*/true);
+
+    if (xds_config_tracker_.has_value()) {
+      xds_config_tracker_->onConfigAccepted(type_url, resources);
+    }
+  }
+  END_TRY
+  CATCH(const EnvoyException& e, {
+    for (auto watch : api_state.watches_) {
+      watch->callbacks_.onConfigUpdateFailed(
+          Envoy::Config::ConfigUpdateFailureReason::UpdateRejected, &e);
+    }
+    ::google::rpc::Status* error_detail = api_state.request_.mutable_error_detail();
+    error_detail->set_code(Grpc::Status::WellKnownGrpcStatus::Internal);
+    error_detail->set_message(Config::Utility::truncateGrpcStatusMessage(e.what()));
+    if (xds_config_tracker_.has_value()) {
+      xds_config_tracker_->onConfigRejected(*message, error_detail->message());
+    }
+  });
+
+  api_state.previously_fetched_data_ = true;
+  api_state.request_.set_response_nonce(message->nonce());
+  ASSERT(api_state.paused());
+  queueDiscoveryRequest(type_url);
+  // same_type_resume drops here.
+  (void)same_type_resume;
 }
 
 void GrpcMuxImpl::processDiscoveryResources(const std::vector<DecodedResourcePtr>& resources,
