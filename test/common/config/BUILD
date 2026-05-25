@@ -31,6 +31,7 @@ envoy_cc_test(
         "//source/common/config:decoded_resource_lib",
         "//source/common/config:opaque_resource_decoder_lib",
         "//source/common/protobuf",
+        "//test/common/stats:stat_test_utility_lib",
         "//test/mocks/config:config_mocks",
         "//test/test_common:simulated_time_system_lib",
         "//test/test_common:utility_lib",

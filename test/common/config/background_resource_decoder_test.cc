@@ -12,6 +12,7 @@
 #include "source/common/config/opaque_resource_decoder_impl.h"
 #include "source/common/protobuf/protobuf.h"
 
+#include "test/common/stats/stat_test_utility.h"
 #include "test/mocks/config/mocks.h"
 #include "test/test_common/simulated_time_system.h"
 #include "test/test_common/utility.h"
