@@ -107,6 +107,16 @@ removed_config_or_runtime:
 # *Normally occurs at the end of the* :ref:`deprecation period <deprecated>`
 
 new_features:
+- area: xds
+  change: |
+    Added a new runtime guard ``envoy.reloadable_features.xds_decode_off_main_thread`` (default false).
+    When enabled, ``Envoy::Config::GrpcMuxImpl`` (the SotW ADS/xDS multiplexer) offloads
+    ``Protobuf::Any`` resource decoding and ``ValidationVisitor`` traversal of incoming
+    ``DiscoveryResponse`` messages onto a dedicated background worker thread
+    (``Envoy::Config::BackgroundResourceDecoder``), and then posts the decoded results back to the main
+    dispatcher to run the existing apply step. This unblocks the main thread on large xDS pushes (for
+    example EDS updates with tens of thousands of endpoints) while preserving Envoy's lock-free
+    main-thread invariants. The legacy synchronous path is bit-identical and remains the default.
 - area: router
   change: |
     Added support for ``refreshRouteCluster`` on weighted cluster routes. When a filter calls

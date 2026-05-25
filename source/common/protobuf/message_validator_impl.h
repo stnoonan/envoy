@@ -7,6 +7,7 @@
 #include "source/common/common/logger.h"
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/synchronization/mutex.h"
 
 namespace Envoy {
 namespace ProtobufMessage {
@@ -37,14 +38,24 @@ public:
 ValidationVisitor& getNullValidationVisitor();
 
 // Base class for both warning and strict validators.
+//
+// Thread-safety: setWipCounter() must be called from the main thread before any
+// worker threads can call onWorkInProgressCommon(). After setup, the wip_counter_
+// pointer is read-only and the increment goes through Stats::Counter (which is
+// itself thread-safe). prestats_wip_count_ is only touched before setWipCounter()
+// is called (i.e. during bootstrap on the main thread), so it does not require
+// its own lock under correct usage; we guard it anyway behind mutex_ to be safe
+// against misuse from background xDS decode threads (see
+// source/common/config/background_resource_decoder.h).
 class WipCounterBase {
 protected:
   void setWipCounter(Stats::Counter& wip_counter);
   void onWorkInProgressCommon(absl::string_view description);
 
 private:
-  Stats::Counter* wip_counter_{};
-  uint64_t prestats_wip_count_{};
+  absl::Mutex mutex_;
+  Stats::Counter* wip_counter_ ABSL_GUARDED_BY(mutex_){};
+  uint64_t prestats_wip_count_ ABSL_GUARDED_BY(mutex_){};
 };
 
 class WarningValidationVisitorImpl : public ValidationVisitorBase,
@@ -54,19 +65,24 @@ public:
   void setCounters(Stats::Counter& unknown_counter, Stats::Counter& wip_counter);
 
   // Envoy::ProtobufMessage::ValidationVisitor
+  //
+  // onUnknownField may be invoked concurrently from background xDS decode
+  // threads when envoy.reloadable_features.xds_decode_off_main_thread is
+  // enabled. Internal mutable state is guarded by mutex_.
   absl::Status onUnknownField(absl::string_view description) override;
   absl::Status onDeprecatedField(absl::string_view description, bool soft_deprecation) override;
   bool skipValidation() override { return false; }
   void onWorkInProgress(absl::string_view description) override;
 
 private:
+  absl::Mutex mutex_;
   // Track hashes of descriptions we've seen, to avoid log spam. A hash is used here to avoid
   // wasting memory with unused strings.
-  absl::flat_hash_set<uint64_t> descriptions_;
+  absl::flat_hash_set<uint64_t> descriptions_ ABSL_GUARDED_BY(mutex_);
   // This can be late initialized via setUnknownCounter(), enabling the server bootstrap loading
   // which occurs prior to the initialization of the stats subsystem.
-  Stats::Counter* unknown_counter_{};
-  uint64_t prestats_unknown_count_{};
+  Stats::Counter* unknown_counter_ ABSL_GUARDED_BY(mutex_){};
+  uint64_t prestats_unknown_count_ ABSL_GUARDED_BY(mutex_){};
 };
 
 class StrictValidationVisitorImpl : public ValidationVisitorBase, public WipCounterBase {

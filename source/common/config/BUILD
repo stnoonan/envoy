@@ -77,6 +77,24 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "background_resource_decoder_lib",
+    srcs = ["background_resource_decoder.cc"],
+    hdrs = ["background_resource_decoder.h"],
+    deps = [
+        ":decoded_resource_lib",
+        "//envoy/config:subscription_interface",
+        "//envoy/event:dispatcher_interface",
+        "//source/common/common:assert_lib",
+        "//source/common/common:logger_lib",
+        "//source/common/common:non_copyable",
+        "//source/common/protobuf",
+        "@abseil-cpp//absl/functional:any_invocable",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
     name = "ttl_lib",
     srcs = ["ttl.cc"],
     hdrs = ["ttl.h"],

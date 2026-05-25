@@ -21,6 +21,7 @@
 #include "source/common/common/logger.h"
 #include "source/common/common/utility.h"
 #include "source/common/config/api_version.h"
+#include "source/common/config/background_resource_decoder.h"
 #include "source/common/config/resource_name.h"
 #include "source/common/config/ttl.h"
 #include "source/common/config/utility.h"
@@ -283,6 +284,27 @@ private:
                                  ApiState& api_state, const std::string& type_url,
                                  const std::string& version_info, bool call_delegate);
 
+  // Synchronous (legacy) path: decode resources on the dispatcher thread and
+  // apply immediately. Behavior is bit-identical to the pre-existing code.
+  // Must be invoked from the main or test thread.
+  void onDiscoveryResponseSync(
+      std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>&& message,
+      ApiState& api_state, ScopedResume same_type_resume);
+
+  // Asynchronous path: hand decoding off to background_decoder_; the apply
+  // step is posted back to the dispatcher. Must be invoked from the dispatcher
+  // thread that owns this GrpcMuxImpl.
+  void onDiscoveryResponseAsync(
+      std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse>&& message,
+      ApiState& api_state, ScopedResume same_type_resume);
+
+  // Continuation of the async path; runs on the dispatcher thread once
+  // background decoding has completed.
+  void
+  applyDecodedResources(std::unique_ptr<envoy::service::discovery::v3::DiscoveryResponse> message,
+                        std::vector<DecodedResourceOrError> decoded_results,
+                        ScopedResume same_type_resume);
+
   Event::Dispatcher& dispatcher_;
   // Multiplexes the stream to the primary and failover sources.
   // TODO(adisuissa): Once envoy.restart_features.xds_failover_support is deprecated,
@@ -324,6 +346,19 @@ private:
   // True iff Envoy is shutting down; no messages should be sent on the `grpc_stream_` when this is
   // true because it may contain dangling pointers.
   std::atomic<bool> shutdown_{false};
+
+  // Lazily created when envoy.reloadable_features.xds_decode_off_main_thread is
+  // enabled. Owns the background worker thread that handles proto unpack +
+  // validation for incoming DiscoveryResponses.
+  BackgroundResourceDecoderPtr background_decoder_;
+
+  // Liveness token shared with background-decode continuation lambdas. Set to
+  // false in the destructor (before background_decoder_ is destroyed) so that
+  // already-queued dispatcher posts can detect that this GrpcMuxImpl has been
+  // torn down and bail out safely. Wrapped in a shared_ptr so the atomic
+  // outlives the GrpcMuxImpl itself; this is the standard "weak self"
+  // workaround when the object is not held by a shared_ptr.
+  const std::shared_ptr<std::atomic<bool>> alive_token_{std::make_shared<std::atomic<bool>>(true)};
 };
 
 using GrpcMuxImplPtr = std::unique_ptr<GrpcMuxImpl>;
